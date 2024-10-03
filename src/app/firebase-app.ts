@@ -59,64 +59,75 @@ export class FirebaseAppInternals {
   public getCachedToken(): FirebaseAccessToken | null {
     return this.cachedToken_ || null;
   }
-
-  private refreshToken(): Promise<FirebaseAccessToken> {
+  private refreshToken(attempts: number = 3): Promise<FirebaseAccessToken> {
     this.isRefreshing = true;
-    return Promise.resolve(this.credential_.getAccessToken())
-      .then((result) => {
+    
+    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  
+    const attemptTokenFetch = async (attempt: number = 1): Promise<FirebaseAccessToken> => {
+      console.log(`[${new Date().toISOString()}] Attempting to fetch OAuth2 access token (Attempt ${attempt}/${attempts})`);
+  
+      try {
+        const result = await this.credential_.getAccessToken();
+        console.log(`[${new Date().toISOString()}] Access token fetched successfully: ${JSON.stringify(result)}`);
+  
         // Since the developer can provide the credential implementation, we want to weakly verify
         // the return type until the type is properly exported.
-        if (!validator.isNonNullObject(result) ||
-          typeof result.expires_in !== 'number' ||
-          typeof result.access_token !== 'string') {
+        if (!validator.isNonNullObject(result) || typeof result.expires_in !== 'number' || typeof result.access_token !== 'string') {
           throw new FirebaseAppError(
             AppErrorCodes.INVALID_CREDENTIAL,
-            `Invalid access token generated: "${JSON.stringify(result)}". Valid access ` +
-            'tokens must be an object with the "expires_in" (number) and "access_token" ' +
-            '(string) properties.',
+            `Invalid access token generated: "${JSON.stringify(result)}". Valid access tokens must be an object with the "expires_in" (number) and "access_token" (string) properties.`,
           );
         }
-
+  
         const token = {
           accessToken: result.access_token,
           expirationTime: Date.now() + (result.expires_in * 1000),
         };
-        if (!this.cachedToken_
-          || this.cachedToken_.accessToken !== token.accessToken
-          || this.cachedToken_.expirationTime !== token.expirationTime) {
-          // Update the cache before firing listeners. Listeners may directly query the
-          // cached token state.
+  
+        // Log token details
+        console.log(`[${new Date().toISOString()}] Token details: Access Token - ${token.accessToken}, Expiration Time - ${new Date(token.expirationTime).toISOString()}`);
+  
+        if (!this.cachedToken_ || this.cachedToken_.accessToken !== token.accessToken || this.cachedToken_.expirationTime !== token.expirationTime) {
+          // Update the cache before firing listeners. Listeners may directly query the cached token state.
           this.cachedToken_ = token;
           this.tokenListeners_.forEach((listener) => {
             listener(token.accessToken);
           });
         }
-
+  
         return token;
-      })
-      .catch((error) => {
+  
+      } catch (error) {
         let errorMessage = (typeof error === 'string') ? error : error.message;
-
-        errorMessage = 'Credential implementation provided to initializeApp() via the ' +
-          '"credential" property failed to fetch a valid Google OAuth2 access token with the ' +
-          `following error: "${errorMessage}".`;
-
+  
+        errorMessage = `Credential implementation provided to initializeApp() via the "credential" property failed to fetch a valid Google OAuth2 access token with the following error: "${errorMessage}".`;
+  
+        // Log error details
+        console.error(`[${new Date().toISOString()}] Error fetching token: ${errorMessage}`);
+  
         if (errorMessage.indexOf('invalid_grant') !== -1) {
-          errorMessage += ' There are two likely causes: (1) your server time is not properly ' +
-          'synced or (2) your certificate key file has been revoked. To solve (1), re-sync the ' +
-          'time on your server. To solve (2), make sure the key ID for your key file is still ' +
-          'present at https://console.firebase.google.com/iam-admin/serviceaccounts/project. If ' +
-          'not, generate a new key file at ' +
-          'https://console.firebase.google.com/project/_/settings/serviceaccounts/adminsdk.';
+          errorMessage += ' There are two likely causes: (1) your server time is not properly synced or (2) your certificate key file has been revoked. To solve (1), re-sync the time on your server. To solve (2), make sure the key ID for your key file is still present at https://console.firebase.google.com/iam-admin/serviceaccounts/project. If not, generate a new key file at https://console.firebase.google.com/project/_/settings/serviceaccounts/adminsdk.';
         }
-
+  
+        if (attempt < attempts) {
+          // Retry with exponential backoff
+          const backoffTime = Math.pow(2, attempt) * 1000;
+          console.log(`[${new Date().toISOString()}] Retrying in ${backoffTime / 1000} seconds...`);
+          await delay(backoffTime);
+          return attemptTokenFetch(attempt + 1);  // Retry the token fetch
+        }
+  
         throw new FirebaseAppError(AppErrorCodes.INVALID_CREDENTIAL, errorMessage);
-      })
+      }
+    };
+  
+    return attemptTokenFetch()
       .finally(() => {
         this.isRefreshing = false;
-      })
+      });
   }
-
+  
   private shouldRefresh(): boolean {
     return (!this.cachedToken_ || (this.cachedToken_.expirationTime - Date.now()) <= TOKEN_EXPIRY_THRESHOLD_MILLIS) 
       && !this.isRefreshing;
